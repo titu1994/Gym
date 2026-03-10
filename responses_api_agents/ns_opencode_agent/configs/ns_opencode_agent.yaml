@@ -1,0 +1,13 @@
+ns_opencode_simple_agent:
+  responses_api_agents:
+    ns_opencode_agent:
+      entrypoint: app.py
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      singularity_image_path: ???
+      singularity_instance_name: ns_opencode_worker
+      data_root: /data
+      concurrency: 1
+      task_timeout: 1800
+      trace_monitor_interval: 120.0
