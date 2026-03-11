@@ -683,6 +683,132 @@ class TestApp:
     async def test_sanity(self, monkeypatch: MonkeyPatch) -> None:
         self._setup_server(monkeypatch)
 
+    def test_chat_completions_forces_non_streaming(self, monkeypatch: MonkeyPatch):
+        server = self._setup_server(monkeypatch)
+        app = server.setup_webserver()
+        client = TestClient(app)
+
+        mock_chat_completion = NeMoGymChatCompletion(
+            id="chtcmpl-123",
+            object="chat.completion",
+            created=FIXED_TIME,
+            model="dummy_model",
+            choices=[
+                NeMoGymChoice(
+                    index=0,
+                    finish_reason="stop",
+                    message=NeMoGymChatCompletionMessage(
+                        role="assistant",
+                        content="non-streamed response",
+                    ),
+                )
+            ],
+        )
+        create_chat_completion_mock = AsyncMock(return_value=mock_chat_completion.model_dump(mode="json"))
+        monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", create_chat_completion_mock)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dummy_model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "non-streamed response"
+
+        assert create_chat_completion_mock.await_args is not None
+        _, called_kwargs = create_chat_completion_mock.await_args
+        assert called_kwargs["stream"] is False
+        assert "stream_options" not in called_kwargs
+
+    def test_chat_completions_enforces_extra_body_sampling_params(self, monkeypatch: MonkeyPatch):
+        server = self._setup_server(monkeypatch)
+        server.config.extra_body = {"temperature": 1.0, "top_p": 1.0}
+        app = server.setup_webserver()
+        client = TestClient(app)
+
+        mock_chat_completion = NeMoGymChatCompletion(
+            id="chtcmpl-123",
+            object="chat.completion",
+            created=FIXED_TIME,
+            model="dummy_model",
+            choices=[
+                NeMoGymChoice(
+                    index=0,
+                    finish_reason="stop",
+                    message=NeMoGymChatCompletionMessage(
+                        role="assistant",
+                        content="sampling overridden",
+                    ),
+                )
+            ],
+        )
+        create_chat_completion_mock = AsyncMock(return_value=mock_chat_completion.model_dump(mode="json"))
+        monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", create_chat_completion_mock)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dummy_model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0.2,
+                "top_p": 0.4,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "sampling overridden"
+
+        assert create_chat_completion_mock.await_args is not None
+        _, called_kwargs = create_chat_completion_mock.await_args
+        assert called_kwargs["temperature"] == 1.0
+        assert called_kwargs["top_p"] == 1.0
+
+    def test_chat_completions_clamps_max_tokens_to_context(self, monkeypatch: MonkeyPatch):
+        server = self._setup_server(monkeypatch)
+        server.config.max_context_length = 32768
+        app = server.setup_webserver()
+        client = TestClient(app)
+
+        mock_chat_completion = NeMoGymChatCompletion(
+            id="chtcmpl-123",
+            object="chat.completion",
+            created=FIXED_TIME,
+            model="dummy_model",
+            choices=[
+                NeMoGymChoice(
+                    index=0,
+                    finish_reason="stop",
+                    message=NeMoGymChatCompletionMessage(
+                        role="assistant",
+                        content="token budget clamped",
+                    ),
+                )
+            ],
+        )
+
+        create_chat_completion_mock = AsyncMock(return_value=mock_chat_completion.model_dump(mode="json"))
+        create_tokenize_mock = AsyncMock(return_value={"tokens": [0] * 10056})
+        monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", create_chat_completion_mock)
+        monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_tokenize", create_tokenize_mock)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dummy_model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 32000,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "token budget clamped"
+
+        assert create_chat_completion_mock.await_args is not None
+        _, called_kwargs = create_chat_completion_mock.await_args
+        assert called_kwargs["max_tokens"] == 22712
+
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
         app = server.setup_webserver()

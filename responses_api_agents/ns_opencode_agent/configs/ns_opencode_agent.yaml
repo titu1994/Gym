@@ -5,8 +5,11 @@ ns_opencode_simple_agent:
       model_server:
         type: responses_api_models
         name: policy_model
-      singularity_image_path: ???
+      execution_backend: singularity
+      singularity_image_path: null
       singularity_instance_name: ns_opencode_worker
+      remote_http_base_url: null
+      remote_http_timeout: 1920
       data_root: /data
       concurrency: 1
       task_timeout: 1800

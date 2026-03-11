@@ -10,6 +10,7 @@ from threading import Lock
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 from nemo_gym.config_types import ModelServerRef
@@ -31,15 +32,22 @@ def _disable_atexit(monkeypatch):
     monkeypatch.setattr("responses_api_agents.ns_opencode_agent.app.atexit.register", lambda *args, **kwargs: None)
 
 
-def _create_config(data_root: Path, concurrency: int = 1) -> NSOpenCodeAgentConfig:
+def _create_config(
+    data_root: Path,
+    concurrency: int = 1,
+    execution_backend: str = "singularity",
+    remote_http_base_url: str | None = None,
+) -> NSOpenCodeAgentConfig:
     return NSOpenCodeAgentConfig(
         host="0.0.0.0",
         port=8080,
         entrypoint="",
         name="ns_opencode_agent",
         model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+        execution_backend=execution_backend,
         singularity_image_path="/tmp/ns-opencode.sif",
         singularity_instance_name="ns-opencode-worker",
+        remote_http_base_url=remote_http_base_url,
         data_root=str(data_root),
         task_timeout=30,
         trace_monitor_interval=3.0,
@@ -72,8 +80,9 @@ def _create_server(tmp_path: Path, concurrency: int = 1) -> NSOpenCodeAgent:
 
 
 def _write_trace_from_command(command: list[str]) -> None:
-    input_file = Path(command[5])
-    workspace_dir = Path(command[6])
+    ns_opencode_idx = command.index("ns_opencode")
+    input_file = Path(command[ns_opencode_idx + 1])
+    workspace_dir = Path(command[ns_opencode_idx + 2])
     sample = json.loads(input_file.read_text(encoding="utf-8").splitlines()[0])
     trace_dir = workspace_dir / "dataset_traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +239,75 @@ async def test_run_nonzero_exit_without_trace_returns_reward_zero(tmp_path: Path
     assert response.reward == 0.0
     assert response.metadata["status"] == "failed"
     assert response.metadata["ns_opencode_returncode"] == 9
+
+
+@pytest.mark.asyncio
+async def test_run_remote_http_success_returns_reward_one(tmp_path: Path) -> None:
+    server = NSOpenCodeAgent(
+        config=_create_config(
+            tmp_path,
+            execution_backend="remote_http",
+            remote_http_base_url="http://127.0.0.1:18080",
+        ),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    server.server_client.global_config_dict = {
+        "policy_model_name": "shared_vllm_model",
+        "policy_api_key": "dummy_key",
+    }
+    request = _create_request()
+
+    with (
+        patch.object(server, "_run_remote_opencode_sync") as run_remote,
+        patch(
+            "responses_api_agents.ns_opencode_agent.app.get_first_server_config_dict",
+            return_value={"host": "127.0.0.1", "port": 8000},
+        ),
+    ):
+        run_remote.return_value = {
+            "status": "completed",
+            "trace_exists": True,
+            "trace_files": ["/data/jobs/j1/workspace/dataset_traces/sample_001-trace0.json"],
+            "job_id": "j1",
+            "ns_opencode_returncode": 0,
+        }
+        response = await server.run(request)
+
+    assert response.reward == 1.0
+    assert response.metadata["execution_backend"] == "remote_http"
+    assert response.metadata["trace_exists"] is True
+    assert response.metadata["job_id"] == "j1"
+
+
+@pytest.mark.asyncio
+async def test_run_remote_http_failure_returns_reward_zero(tmp_path: Path) -> None:
+    server = NSOpenCodeAgent(
+        config=_create_config(
+            tmp_path,
+            execution_backend="remote_http",
+            remote_http_base_url="http://127.0.0.1:18080",
+        ),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    server.server_client.global_config_dict = {
+        "policy_model_name": "shared_vllm_model",
+        "policy_api_key": "dummy_key",
+    }
+    request = _create_request()
+
+    with (
+        patch.object(server, "_run_remote_opencode_sync", side_effect=requests.RequestException("connection failed")),
+        patch(
+            "responses_api_agents.ns_opencode_agent.app.get_first_server_config_dict",
+            return_value={"host": "127.0.0.1", "port": 8000},
+        ),
+    ):
+        response = await server.run(request)
+
+    assert response.reward == 0.0
+    assert response.metadata["status"] == "failed"
+    assert response.metadata["execution_backend"] == "remote_http"
+    assert "remote_http backend error" in response.metadata["error"]
 
 
 def test_run_api_success_returns_reward_one(tmp_path: Path) -> None:

@@ -9,9 +9,10 @@ import time
 from asyncio import Semaphore
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
+import requests
 from fastapi import FastAPI
 from pydantic import ConfigDict, Field
 
@@ -24,8 +25,11 @@ from nemo_gym.server_utils import get_first_server_config_dict
 
 class NSOpenCodeAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
-    singularity_image_path: str
-    singularity_instance_name: str
+    execution_backend: Literal["singularity", "remote_http"] = "singularity"
+    singularity_image_path: Optional[str] = None
+    singularity_instance_name: str = "ns_opencode_worker"
+    remote_http_base_url: Optional[str] = None
+    remote_http_timeout: int = 1920
     data_root: str = "/data"
     task_timeout: int = 1800
     trace_monitor_interval: float = 120.0
@@ -47,6 +51,8 @@ class NSOpenCodeAgentVerifyResponse(BaseVerifyResponse):
 
 
 class NSOpenCodeAgent(SimpleResponsesAPIAgent):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     config: NSOpenCodeAgentConfig
     sem: Semaphore = None
 
@@ -57,8 +63,16 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
         self._lifecycle_lock = Lock()
-        self._ensure_instance_started_sync()
-        atexit.register(self._stop_instance_on_exit)
+        if self.config.execution_backend == "singularity":
+            if not self.config.singularity_image_path:
+                raise ValueError("singularity_image_path is required when execution_backend='singularity'")
+            self._ensure_instance_started_sync()
+            atexit.register(self._stop_instance_on_exit)
+        elif self.config.execution_backend == "remote_http":
+            if not self.config.remote_http_base_url:
+                raise ValueError("remote_http_base_url is required when execution_backend='remote_http'")
+        else:
+            raise ValueError(f"Unsupported execution_backend: {self.config.execution_backend}")
 
     def setup_webserver(self) -> FastAPI:
         app = FastAPI()
@@ -99,6 +113,7 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
         return result.returncode == 0
 
     def _build_instance_start_command(self) -> List[str]:
+        assert self.config.singularity_image_path
         command = ["singularity", "instance", "start"]
         command.extend(self.config.instance_start_args)
 
@@ -186,6 +201,27 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
             "store": True,
         }
 
+    def _build_minimal_training_output_item(self, text: str) -> Dict[str, Any]:
+        # NeMo RL rollout post-processing requires at least one output item with
+        # generation token IDs and logprobs.
+        return {
+            "id": f"msg_{uuid4().hex}",
+            "content": [
+                {
+                    "annotations": [],
+                    "logprobs": None,
+                    "text": text,
+                    "type": "output_text",
+                }
+            ],
+            "role": "assistant",
+            "status": "completed",
+            "type": "message",
+            "prompt_token_ids": [0],
+            "generation_token_ids": [0],
+            "generation_log_probs": [0.0],
+        }
+
     def _sanitize_identifier(self, text: str) -> str:
         return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text)
 
@@ -234,7 +270,20 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
         reward: float,
         metadata: Dict[str, Any],
     ) -> NSOpenCodeAgentVerifyResponse:
-        response_obj = NeMoGymResponse.model_validate(self._default_response(model_name))
+        status = str(metadata.get("status", "completed"))
+        trace_exists = bool(metadata.get("trace_exists", False))
+        output_text = "ns_opencode trace found" if trace_exists else f"ns_opencode run status: {status}"
+
+        response_dict = self._default_response(model_name)
+        response_dict["output"] = [self._build_minimal_training_output_item(output_text)]
+        response_dict["usage"] = {
+            "input_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 1,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 1,
+        }
+        response_obj = NeMoGymResponse.model_validate(response_dict)
         return NSOpenCodeAgentVerifyResponse(
             responses_create_params=body.responses_create_params,
             response=response_obj,
@@ -243,6 +292,16 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
             metadata=metadata,
         )
 
+    def _run_remote_opencode_sync(self, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+        assert self.config.remote_http_base_url
+        endpoint = f"{self.config.remote_http_base_url.rstrip('/')}/run"
+        response = requests.post(endpoint, json=payload, timeout=timeout)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError(f"Remote response must be a dict, got {type(result)}")
+        return result
+
     async def run(self, body: NSOpenCodeAgentRunRequest = Body()) -> NSOpenCodeAgentVerifyResponse:
         async with self.sem:
             global_config_dict = self.server_client.global_config_dict
@@ -250,6 +309,63 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
             api_key = global_config_dict.get("policy_api_key", "dummy_key")
             model_server_config = get_first_server_config_dict(global_config_dict, self.config.model_server.name)
             base_url = f"http://{model_server_config['host']}:{model_server_config['port']}/v1"
+
+            safe_instance_id = self._sanitize_identifier(body.instance_id)
+            job_id = f"{safe_instance_id}-{uuid4().hex[:8]}"
+            sample = dict(body.sample)
+            sample_uuid = str(sample.get("uuid") or body.instance_id)
+            sample["uuid"] = sample_uuid
+            if self.config.execution_backend == "remote_http":
+                timeout_seconds = int(max(self.config.remote_http_timeout, self.config.task_timeout + 120))
+                payload = {
+                    "job_id": job_id,
+                    "sample": sample,
+                    "model_name": model_name,
+                    "openai_base_url": base_url,
+                    "openai_api_key": api_key,
+                    "provider": "vllm",
+                    "task_timeout": self.config.task_timeout,
+                    "trace_monitor_interval": self.config.trace_monitor_interval,
+                    "data_root": self.config.data_root,
+                    "ns_opencode_cli_args": self.config.ns_opencode_cli_args,
+                }
+
+                try:
+                    remote_metadata = await asyncio.to_thread(self._run_remote_opencode_sync, payload, timeout_seconds)
+                except Exception as e:
+                    return self._build_verify_response(
+                        body=body,
+                        model_name=model_name,
+                        reward=0.0,
+                        metadata={
+                            "status": "failed",
+                            "error": f"remote_http backend error: {type(e).__name__}: {e}",
+                            "job_id": job_id,
+                            "sample_uuid": sample_uuid,
+                            "execution_backend": "remote_http",
+                            "remote_http_base_url": self.config.remote_http_base_url,
+                        },
+                    )
+
+                trace_files = remote_metadata.get("trace_files", [])
+                trace_exists = bool(remote_metadata.get("trace_exists", len(trace_files) > 0))
+                reward = 1.0 if trace_exists else 0.0
+                metadata = dict(remote_metadata)
+                metadata.setdefault("job_id", job_id)
+                metadata.setdefault("sample_uuid", sample_uuid)
+                metadata["trace_exists"] = trace_exists
+                metadata["trace_files"] = trace_files
+                metadata["execution_backend"] = "remote_http"
+                metadata["remote_http_base_url"] = self.config.remote_http_base_url
+                metadata["provider"] = "vllm"
+                metadata["model_name"] = model_name
+                metadata["base_url"] = base_url
+                return self._build_verify_response(
+                    body=body,
+                    model_name=model_name,
+                    reward=reward,
+                    metadata=metadata,
+                )
 
             if not await asyncio.to_thread(self._is_instance_available_sync):
                 return self._build_verify_response(
@@ -260,11 +376,10 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
                         "status": "failed",
                         "error": "Singularity instance is unavailable",
                         "instance_name": self.config.singularity_instance_name,
+                        "execution_backend": "singularity",
                     },
                 )
 
-            safe_instance_id = self._sanitize_identifier(body.instance_id)
-            job_id = f"{safe_instance_id}-{uuid4().hex[:8]}"
             job_dir = Path(self.config.data_root) / "jobs" / job_id
             workspace_dir = job_dir / "workspace"
             logs_dir = job_dir / "logs"
@@ -273,10 +388,6 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
 
             logs_dir.mkdir(parents=True, exist_ok=True)
             workspace_dir.mkdir(parents=True, exist_ok=True)
-
-            sample = dict(body.sample)
-            sample_uuid = str(sample.get("uuid") or body.instance_id)
-            sample["uuid"] = sample_uuid
             with open(input_file, "w", encoding="utf-8") as f:
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
@@ -302,6 +413,7 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
                         "job_id": job_id,
                         "workspace_dir": str(workspace_dir),
                         "dataset_file": str(input_file),
+                        "execution_backend": "singularity",
                     },
                 )
 
@@ -342,6 +454,7 @@ class NSOpenCodeAgent(SimpleResponsesAPIAgent):
                     "provider": "vllm",
                     "model_name": model_name,
                     "base_url": base_url,
+                    "execution_backend": "singularity",
                 },
             )
 

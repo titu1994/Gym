@@ -71,6 +71,7 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
 
     # Corresponds to the extra_body of OpenAI Client.
     extra_body: Optional[Dict[str, Any]] = None
+    max_context_length: Optional[int] = None
 
     def model_post_init(self, context):
         if isinstance(self.base_url, str):
@@ -80,6 +81,44 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
 
 class VLLMModel(SimpleResponsesAPIModel):
     config: VLLMModelConfig
+
+    async def _clamp_completion_tokens_to_context(
+        self,
+        client: NeMoGymAsyncOpenAI,
+        create_params: Dict[str, Any],
+    ) -> None:
+        if not self.config.max_context_length:
+            return
+
+        token_key = None
+        if "max_tokens" in create_params:
+            token_key = "max_tokens"
+        elif "max_completion_tokens" in create_params:
+            token_key = "max_completion_tokens"
+
+        if token_key is None:
+            return
+
+        requested_tokens = create_params.get(token_key)
+        if not isinstance(requested_tokens, int) or requested_tokens <= 0:
+            return
+
+        tokenize_body = {
+            key: create_params[key]
+            for key in ("model", "messages", "tools")
+            if key in create_params
+        }
+        if "messages" not in tokenize_body:
+            return
+
+        try:
+            tokenize_response = await client.create_tokenize(**tokenize_body)
+        except Exception:
+            return
+
+        prompt_tokens = tokenize_response.get("tokens") or []
+        available_tokens = self.config.max_context_length - len(prompt_tokens)
+        create_params[token_key] = max(1, min(requested_tokens, available_tokens))
 
     def model_post_init(self, context):
         self._clients = [
@@ -141,9 +180,31 @@ class VLLMModel(SimpleResponsesAPIModel):
             incomplete_details={"reason": "max_output_tokens"} if choice.finish_reason == "length" else None,
         )
 
+    def _normalize_chat_completion_create_params(
+        self, body: Any
+    ) -> NeMoGymChatCompletionCreateParamsNonStreaming:
+        if isinstance(body, NeMoGymChatCompletionCreateParamsNonStreaming):
+            return body
+
+        if isinstance(body, BaseModel):
+            body_dict = body.model_dump(exclude_unset=True)
+        else:
+            body_dict = dict(body or {})
+
+        # Force non-streaming mode for compatibility with non-streaming-only model servers.
+        if body_dict.get("stream") not in (None, False):
+            body_dict["stream"] = False
+
+        # stream_options are only meaningful for streaming responses.
+        body_dict.pop("stream_options", None)
+
+        return NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(body_dict)
+
     async def chat_completions(
-        self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming = Body()
+        self, request: Request, body: Any = Body()
     ) -> NeMoGymChatCompletion:
+        body = self._normalize_chat_completion_create_params(body)
+
         if self.config.replace_developer_role_with_system:
             for message in body.messages:
                 if message["role"] == "developer":
@@ -210,6 +271,11 @@ class VLLMModel(SimpleResponsesAPIModel):
 
         if self.config.extra_body:
             create_params = self.config.extra_body | create_params
+            for key in ("temperature", "top_p"):
+                if key in self.config.extra_body:
+                    create_params[key] = self.config.extra_body[key]
+
+        await self._clamp_completion_tokens_to_context(client, create_params)
 
         try:
             chat_completion_dict = await client.create_chat_completion(**create_params)
